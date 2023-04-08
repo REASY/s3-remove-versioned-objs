@@ -26,6 +26,18 @@ impl From<::tokio::task::JoinError> for AppError {
     }
 }
 
+impl From<::aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::delete_objects::DeleteObjectsError>>
+    for AppError
+{
+    fn from(
+        error: aws_sdk_s3::error::SdkError<
+            aws_sdk_s3::operation::delete_objects::DeleteObjectsError,
+        >,
+    ) -> Self {
+        AppError::S3Error(Box::new(error.into()))
+    }
+}
+
 impl Display for AppError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
