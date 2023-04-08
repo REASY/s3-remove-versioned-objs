@@ -161,7 +161,7 @@ async fn collect_objects_in_parallel(
     }
     // Sort them to have stable output
     all_obj_to_remove.sort_by(|a, b| {
-        let key_a = (a.key(), b.version_id());
+        let key_a = (a.key(), a.version_id());
         let key_b = (b.key(), b.version_id());
         key_a.cmp(&key_b)
     });
