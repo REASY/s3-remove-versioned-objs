@@ -1,0 +1,19 @@
+# Scan this file for changes every 10 seconds
+refresh_rate: 10 seconds
+
+appenders:
+  # An appender named "stdout" that writes to stdout
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%d-%m-%Y %H:%M:%S%.3f)} {l} {T}[{I}] {f}:{L}: {m}{n}"
+
+# Set the default logging level to "warn" and attach the "stdout" appender to the root
+root:
+  level: INFO
+  appenders:
+    - stdout
+
+loggers:
+  s3_remove_versioned_objs:
+    level: DEBUG
