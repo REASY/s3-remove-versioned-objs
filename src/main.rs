@@ -15,6 +15,7 @@ use clap::Parser;
 use crossbeam::queue::ArrayQueue;
 use csv::StringRecord;
 use log::{info, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
@@ -81,11 +82,39 @@ async fn main() -> Result<()> {
         found_objects.len(),
         to_adjusted_byte_unit(total_size)
     );
+    let mut id_to_obj_size: HashMap<(Option<&str>, Option<&str>), i64> = HashMap::new();
+    for obj in &found_objects {
+        let key: (Option<&str>, Option<&str>) = (obj.key(), obj.version_id());
+        id_to_obj_size.insert(key, obj.size());
+    }
     if !found_objects.is_empty() {
         let removed_objs = remove_objects(args.clone(), config, found_objects.as_slice()).await?;
-        let total_removed: usize = removed_objs.iter().map(|r| { r.deleted().unwrap_or_default().len()}).sum();
-        let total_errors: usize = removed_objs.iter().map(|r| { r.errors().unwrap_or_default().len()}).sum();
-        info!("Removed {} objects and could not remove {} objects", total_removed, total_errors);
+        let total_removed: usize = removed_objs
+            .iter()
+            .map(|r| r.deleted().unwrap_or_default().len())
+            .sum();
+        let total_removed_size: u128 = removed_objs
+            .iter()
+            .map(|r| {
+                let sz: i64 = r
+                    .deleted()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|x| id_to_obj_size.get(&(x.key(), x.version_id())).unwrap())
+                    .sum();
+                sz as u128
+            })
+            .sum();
+        let total_errors: usize = removed_objs
+            .iter()
+            .map(|r| r.errors().unwrap_or_default().len())
+            .sum();
+        info!(
+            "Removed {} objects with total size {} and could not remove {} objects",
+            total_removed,
+            to_adjusted_byte_unit(total_removed_size),
+            total_errors
+        );
     }
     Ok(())
 }
