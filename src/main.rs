@@ -159,6 +159,11 @@ async fn collect_objects_in_parallel(
         let r = t.await??;
         all_obj_to_remove.extend(r);
     }
+    all_obj_to_remove.dedup_by(|a, b| {
+        let key_a = (a.key(), a.version_id());
+        let key_b = (b.key(), b.version_id());
+        key_a == key_b
+    });
     // Sort them to have stable output
     all_obj_to_remove.sort_by(|a, b| {
         let key_a = (a.key(), a.version_id());
