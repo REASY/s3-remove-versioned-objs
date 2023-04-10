@@ -288,7 +288,8 @@ async fn remove_objects(
                     }
                     Some(delete_objects) => {
                         if is_dryrun {
-                            info!("{} objects from bucket {} would have been removed, but aren't because of dryrun mode!", delete_objects.len(), bucket)
+                            info!("{} objects from bucket {} would have been removed, but aren't because of dryrun mode!", delete_objects.len(), bucket);
+                            delete_objects.iter().for_each(|c| { info!("Object {} with version {}", c.key().unwrap_or_default(), c.version_id().unwrap_or_default())});
                         } else {
                             let resp: DeleteObjectsOutput = client
                                 .delete_objects()
