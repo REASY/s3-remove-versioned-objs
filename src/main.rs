@@ -5,16 +5,17 @@ use crate::errors::AppError::CsvError;
 use crate::errors::Result;
 use crate::object_collector::ObjectCollector;
 use aws_config::retry::RetryConfig;
-use aws_config::SdkConfig;
+use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
 use aws_sdk_s3::operation::{RequestId, RequestIdExt};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, ObjectVersion};
-use byte_unit::Byte;
+use byte_unit::{Byte, UnitType};
 use clap::Parser;
 use crossbeam::queue::ArrayQueue;
-use csv::StringRecord;
+use csv::{QuoteStyle, StringRecord, WriterBuilder};
 use log::{info, warn};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,6 +34,10 @@ struct Args {
     #[clap(long)]
     key_list_csv_path: String,
 
+    /// Path to CSV file with the list of prefixes to not remove. It has to have column `key_prefix`
+    #[clap(long)]
+    prefix_exclude_list_csv_path: Option<String>,
+
     /// The name of the column in CSV file that holds keys to be deleted
     #[clap(long, default_value_t = String::from("s3_key"))]
     key_column_name: String,
@@ -44,6 +49,25 @@ struct Args {
     /// Displays the operations that would be performed using the specified command without actually running them
     #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
     dryrun: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoveObjectRecord<'a> {
+    key: Option<&'a str>,
+    version_id: Option<&'a str>,
+    last_modified: Option<String>,
+    storage_class: Option<String>,
+    size: Option<i64>,
+    e_tag: Option<&'a str>,
+    is_deleted: bool,
+    delete_marker: Option<bool>,
+    delete_marker_version_id: Option<&'a str>,
+    is_dryrun: bool,
+    has_error: bool,
+    error_code: Option<&'a str>,
+    error_message: Option<&'a str>,
+    request_id: Option<&'a str>,
+    extended_request_id: Option<&'a str>,
 }
 
 #[tokio::main]
@@ -67,48 +91,160 @@ async fn main() -> Result<()> {
         args.key_column_name
     );
 
-    let config: SdkConfig = aws_config::from_env()
+    let prefix_exclude_list: Vec<String> = match args.prefix_exclude_list_csv_path.as_ref() {
+        None => Result::Ok(Vec::new())?,
+        Some(p) => load_object_keys(p.as_str(), "key_prefix")?,
+    };
+    info!(
+        "prefix_exclude_list has {} prefixes",
+        prefix_exclude_list.len()
+    );
+
+    let config: SdkConfig = aws_config::defaults(BehaviorVersion::v2023_11_09())
         .retry_config(RetryConfig::standard().with_max_attempts(30))
         .load()
         .await;
 
-    let found_objects = collect_objects_in_parallel(config.clone(), args.clone(), keys).await?;
-    let total_size: u128 = found_objects
+    let found_objects: Vec<ObjectVersion> =
+        collect_objects_in_parallel(config.clone(), args.clone(), keys).await?;
+    let to_remove_objs: Vec<ObjectVersion> = found_objects
         .iter()
-        .map(|x| u128::try_from(x.size()).unwrap())
+        .filter(|&obj| {
+            // FIXME: If this is too slow, improve it later
+            // Note: Iterator.filter returns iterator that will yield only the elements for which the closure returns true.
+            let should_exclude_from_removal = prefix_exclude_list
+                .iter()
+                .any(|exclude_prefix| obj.key().unwrap_or_default().contains(exclude_prefix));
+            // if should_exclude_from_removal == true, we should return false
+            !should_exclude_from_removal
+        })
+        .cloned()
+        .collect();
+
+    let total_size: u128 = to_remove_objs
+        .iter()
+        .map(|x| u128::try_from(x.size().unwrap()).unwrap())
         .sum();
     info!(
-        "Found {} objects with total size {} to be removed",
+        "Found {} objects after filtering got {} objects with total size {} to be removed",
         found_objects.len(),
+        to_remove_objs.len(),
         to_adjusted_byte_unit(total_size)
     );
-    let mut id_to_obj_size: HashMap<(Option<&str>, Option<&str>), i64> = HashMap::new();
-    for obj in &found_objects {
+    let mut id_to_obj: HashMap<(Option<&str>, Option<&str>), ObjectVersion> = HashMap::new();
+    for obj in &to_remove_objs {
         let key: (Option<&str>, Option<&str>) = (obj.key(), obj.version_id());
-        id_to_obj_size.insert(key, obj.size());
+        id_to_obj.insert(key, obj.clone());
     }
-    if !found_objects.is_empty() {
-        let removed_objs = remove_objects(args.clone(), config, found_objects.as_slice()).await?;
-        let total_removed: usize = removed_objs
-            .iter()
-            .map(|r| r.deleted().unwrap_or_default().len())
-            .sum();
+    if !to_remove_objs.is_empty() {
+        let removed_objs = remove_objects(args.clone(), config, to_remove_objs.as_slice()).await?;
+        let report_records: Vec<RemoveObjectRecord> = if removed_objs.is_empty() {
+            to_remove_objs
+                .iter()
+                .map(|x| RemoveObjectRecord {
+                    key: x.key(),
+                    version_id: x.version_id(),
+                    last_modified: x.last_modified.map(|d| format!("{}", d)),
+                    storage_class: x.storage_class().map(|x| x.as_str().to_string()),
+                    size: x.size,
+                    e_tag: x.e_tag(),
+                    is_deleted: false,
+                    delete_marker: None,
+                    delete_marker_version_id: None,
+                    is_dryrun: args.dryrun,
+                    has_error: false,
+                    error_code: None,
+                    error_message: None,
+                    request_id: None,
+                    extended_request_id: None,
+                })
+                .collect()
+        } else {
+            let mut res: Vec<RemoveObjectRecord> = Vec::new();
+            removed_objs.iter().for_each(|r| {
+                let request_id = r.request_id();
+                let extended_request_id = r.extended_request_id();
+                // Create records for delete objects
+                r.deleted().iter().for_each(|d| {
+                    let key = (d.key(), d.version_id());
+                    let x = id_to_obj.get(&key).unwrap();
+                    let obj = RemoveObjectRecord {
+                        key: x.key(),
+                        version_id: x.version_id(),
+                        last_modified: x.last_modified.map(|d| format!("{}", d)),
+                        storage_class: x.storage_class().map(|x| x.as_str().to_string()),
+                        size: x.size,
+                        e_tag: x.e_tag(),
+                        is_deleted: true,
+                        delete_marker: d.delete_marker,
+                        delete_marker_version_id: d.delete_marker_version_id(),
+                        is_dryrun: args.dryrun,
+                        has_error: false,
+                        error_code: None,
+                        error_message: None,
+                        request_id,
+                        extended_request_id,
+                    };
+                    res.push(obj);
+                });
+                // Create records for failed objects
+                r.errors().iter().for_each(|d| {
+                    let key = (d.key(), d.version_id());
+                    let x = id_to_obj.get(&key).unwrap();
+                    let obj = RemoveObjectRecord {
+                        key: x.key(),
+                        version_id: x.version_id(),
+                        last_modified: x.last_modified.map(|d| format!("{}", d)),
+                        storage_class: x.storage_class().map(|x| x.as_str().to_string()),
+                        size: x.size,
+                        e_tag: x.e_tag(),
+                        is_deleted: false,
+                        delete_marker: None,
+                        delete_marker_version_id: None,
+                        is_dryrun: args.dryrun,
+                        has_error: true,
+                        error_code: d.code(),
+                        error_message: d.message(),
+                        request_id,
+                        extended_request_id,
+                    };
+                    res.push(obj);
+                });
+            });
+            // Create record for objects that could not delete
+            res
+        };
+
+        {
+            let mut wrt = WriterBuilder::new()
+                .quote_style(QuoteStyle::NonNumeric)
+                .from_path("result.csv")
+                .unwrap();
+            for r in report_records {
+                wrt.serialize(r)?;
+            }
+            wrt.flush().unwrap();
+        }
+
+        let total_removed: usize = removed_objs.iter().map(|r| r.deleted().len()).sum();
         let total_removed_size: u128 = removed_objs
             .iter()
             .map(|r| {
                 let sz: i64 = r
                     .deleted()
-                    .unwrap_or_default()
                     .iter()
-                    .map(|x| id_to_obj_size.get(&(x.key(), x.version_id())).unwrap())
+                    .map(|x| {
+                        id_to_obj
+                            .get(&(x.key(), x.version_id()))
+                            .unwrap()
+                            .size()
+                            .unwrap()
+                    })
                     .sum();
                 sz as u128
             })
             .sum();
-        let total_errors: usize = removed_objs
-            .iter()
-            .map(|r| r.errors().unwrap_or_default().len())
-            .sum();
+        let total_errors: usize = removed_objs.iter().map(|r| r.errors().len()).sum();
         info!(
             "Removed {} objects with total size {} and could not remove {} objects",
             total_removed,
@@ -237,8 +373,9 @@ fn load_object_keys(csv_path: &str, column_name: &str) -> Result<Vec<String>> {
 }
 
 fn to_adjusted_byte_unit(bytes: u128) -> String {
-    Byte::from_bytes(bytes)
-        .get_appropriate_unit(true)
+    Byte::from_u128(bytes)
+        .unwrap()
+        .get_appropriate_unit(UnitType::Binary)
         .to_string()
 }
 
@@ -260,6 +397,7 @@ async fn remove_objects(
                         .key(obj.key().unwrap())
                         .version_id(obj.version_id().unwrap())
                         .build()
+                        .unwrap()
                 })
                 .collect::<Vec<_>>();
             to_delete
@@ -289,18 +427,29 @@ async fn remove_objects(
                     Some(delete_objects) => {
                         if is_dryrun {
                             info!("{} objects from bucket {} would have been removed, but aren't because of dryrun mode!", delete_objects.len(), bucket);
-                            delete_objects.iter().for_each(|c| { info!("Object {} with version {}", c.key().unwrap_or_default(), c.version_id().unwrap_or_default())});
+                            delete_objects.iter().for_each(|c| {
+                                info!(
+                                    "Object {} with version {}",
+                                    c.key(),
+                                    c.version_id().unwrap_or_default()
+                                )
+                            });
                         } else {
                             let resp: DeleteObjectsOutput = client
                                 .delete_objects()
                                 .bucket(bucket.clone())
-                                .delete(Delete::builder().set_objects(Some(delete_objects)).build())
+                                .delete(
+                                    Delete::builder()
+                                        .set_objects(Some(delete_objects))
+                                        .build()
+                                        .unwrap(),
+                                )
                                 .send()
                                 .await?;
-                            let n_errors = resp.errors().unwrap_or_default().len();
+                            let n_errors = resp.errors().len();
                             if n_errors > 0 {
-                                warn!("Bucket {}: {} objects have been removed. Could not remove {} objects!", bucket, resp.deleted().unwrap_or_default().len(), n_errors);
-                                resp.errors().unwrap_or_default().iter().for_each(|err| {
+                                warn!("Bucket {}: {} objects have been removed. Could not remove {} objects!", bucket, resp.deleted().len(), n_errors);
+                                resp.errors().iter().for_each(|err| {
                                     warn!("Could not remove {} with version {}. Error message: {}, code: {}. Request was {}/{}", err.key().unwrap_or_default(),
                                         err.version_id().unwrap_or_default(),
                                         err.message().unwrap_or_default(),
@@ -312,10 +461,10 @@ async fn remove_objects(
                                 info!(
                                     "Bucket {}: {} objects have been removed",
                                     bucket,
-                                    resp.deleted().unwrap_or_default().len()
+                                    resp.deleted().len()
                                 );
-                                resp.deleted().unwrap_or_default().iter().for_each(|del_obj| {
-                                    info!("Delete object {} with version {}, is_delete_marker: {}, delete_marker_version_id: {}", del_obj.key().unwrap_or_default(),
+                                resp.deleted().iter().for_each(|del_obj| {
+                                    info!("Delete object {} with version {}, is_delete_marker: {:?}, delete_marker_version_id: {}", del_obj.key().unwrap_or_default(),
                                         del_obj.version_id().unwrap_or_default(),
                                         del_obj.delete_marker(),
                                         del_obj.delete_marker_version_id().unwrap_or_default());

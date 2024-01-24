@@ -51,9 +51,9 @@ impl<'a> ObjectCollector<'a> {
                 "Listed object versions for next_key_marker = {}. n = {}, response has {} items",
                 &marker,
                 n,
-                resp.versions().unwrap_or_default().len(),
+                resp.versions().len(),
             );
-            match resp.versions() {
+            match &resp.versions {
                 None => {
                     break;
                 }
