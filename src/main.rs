@@ -11,6 +11,7 @@ use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
 use aws_sdk_s3::operation::{RequestId, RequestIdExt};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, ObjectVersion};
 use byte_unit::{Byte, UnitType};
+use chrono::SecondsFormat;
 use clap::Parser;
 use crossbeam::queue::ArrayQueue;
 use csv::{QuoteStyle, StringRecord, WriterBuilder};
@@ -215,44 +216,64 @@ async fn main() -> Result<()> {
             res
         };
 
-        {
-            let mut wrt = WriterBuilder::new()
-                .quote_style(QuoteStyle::NonNumeric)
-                .from_path("result.csv")
-                .unwrap();
-            for r in report_records {
-                wrt.serialize(r)?;
-            }
-            wrt.flush().unwrap();
-        }
-
-        let total_removed: usize = removed_objs.iter().map(|r| r.deleted().len()).sum();
-        let total_removed_size: u128 = removed_objs
-            .iter()
-            .map(|r| {
-                let sz: i64 = r
-                    .deleted()
-                    .iter()
-                    .map(|x| {
-                        id_to_obj
-                            .get(&(x.key(), x.version_id()))
-                            .unwrap()
-                            .size()
-                            .unwrap()
-                    })
-                    .sum();
-                sz as u128
-            })
-            .sum();
-        let total_errors: usize = removed_objs.iter().map(|r| r.errors().len()).sum();
-        info!(
-            "Removed {} objects with total size {} and could not remove {} objects",
-            total_removed,
-            to_adjusted_byte_unit(total_removed_size),
-            total_errors
+        let date_str = format!(
+            "{}",
+            chrono::offset::Local::now()
+                .to_rfc3339_opts(SecondsFormat::Millis, false)
+                .replace(":", "_")
         );
+        let csv_path = format!(
+            "result_{}.csv",
+            &date_str[0.."2018-01-26T18:30:09.453".len()]
+        );
+        save_result_as_csv(report_records.as_slice(), &csv_path)?;
+
+        show_stats(&id_to_obj, removed_objs.as_slice());
     }
     Ok(())
+}
+
+fn save_result_as_csv(report_records: &[RemoveObjectRecord], path: &str) -> Result<()> {
+    let mut wrt = WriterBuilder::new()
+        .quote_style(QuoteStyle::NonNumeric)
+        .from_path(path)
+        .unwrap();
+    for r in report_records {
+        wrt.serialize(r)?;
+    }
+    wrt.flush().unwrap();
+    Ok(())
+}
+
+fn show_stats(
+    id_to_obj: &HashMap<(Option<&str>, Option<&str>), ObjectVersion>,
+    removed_objs: &[DeleteObjectsOutput],
+) {
+    let total_removed: usize = removed_objs.iter().map(|r| r.deleted().len()).sum();
+    let total_removed_size: u128 = removed_objs
+        .iter()
+        .map(|r| {
+            let sz: i64 = r
+                .deleted()
+                .iter()
+                .map(|x| {
+                    id_to_obj
+                        .get(&(x.key(), x.version_id()))
+                        .unwrap()
+                        .size()
+                        .unwrap()
+                })
+                .sum();
+            sz as u128
+        })
+        .sum();
+    let total_errors: usize = removed_objs.iter().map(|r| r.errors().len()).sum();
+    info!(
+        "Removed {} objects with total size {} and could not remove {} objects",
+        total_removed,
+        to_adjusted_byte_unit(total_removed_size),
+        total_errors
+    );
 }
 
 async fn collect_objects_in_parallel(
